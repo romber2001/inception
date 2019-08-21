@@ -53,6 +53,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 // reset_mqh
 #include "sql_rename.h"       // mysql_rename_table
 #include <string.h>
+#include <sstream>
 #include "sql_tablespace.h"   // mysql_alter_tablespace
 #include "hostname.h"         // hostname_cache_refresh
 #include "sql_acl.h"          // *_ACL, check_grant, is_acl_user,
@@ -113,6 +114,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA */
 #include "sql_time.h"
 using std::max;
 using std::min;
+using std::stringstream;
 
 #define FLAGSTR(V,F) ((V)&(F)?#F" ":"")
 
@@ -546,6 +548,8 @@ mysql_statement_is_backup(
         sql_cache_node->optype == SQLCOM_DELETE ||
         sql_cache_node->optype == SQLCOM_INSERT_SELECT ||
         sql_cache_node->optype == SQLCOM_UPDATE ||
+        sql_cache_node->optype == SQLCOM_UPDATE_MULTI ||
+        sql_cache_node->optype == SQLCOM_DELETE_MULTI ||
         sql_cache_node->optype == SQLCOM_CREATE_TABLE ||
         sql_cache_node->optype == SQLCOM_DROP_TABLE ||
         sql_cache_node->optype == SQLCOM_ALTER_TABLE)
@@ -598,6 +602,7 @@ void mysql_compute_sql_sha1(THD* thd, sql_cache_node_t* sql_cache_node)
     String str(str_get(sqlinfo), system_charset_info);
     calculate_password(&str, m_hashed_password_buffer);
     strcpy(sql_cache_node->sqlsha1, m_hashed_password_buffer);
+    str_deinit(sqlinfo);
 }
 
 int mysql_cache_one_sql(THD* thd)
@@ -1880,6 +1885,8 @@ int mysql_get_err_level_by_errno(THD *   thd)
     case ER_TOO_MANY_KEY_PARTS:
     case ER_UDPATE_TOO_MUCH_ROWS:
     case ER_TOO_MANY_KEYS:
+    case ER_PK_TOO_MANY_PARTS:
+    case ER_PK_COLS_NOT_INT:
     case ER_TIMESTAMP_DEFAULT:
     case ER_CANT_DROP_FIELD_OR_KEY:
     case ER_CHAR_TO_VARCHAR_LEN:
@@ -1956,6 +1963,8 @@ int mysql_get_err_level_by_errno(THD *   thd)
     case ER_COLLATION_CHARSET_MISMATCH:
     case ER_VIEW_SELECT_CLAUSE:
     case ER_NOT_SUPPORTED_ITEM_TYPE:
+    case ER_INCEPTION_EMPTY_QUERY:
+    case ER_TABLE_ENGINE_NOT_ALLOWED:
         return INCEPTION_PARSE;
 
     default:
@@ -2028,6 +2037,17 @@ mysql_check_inception_variables(
             return false;
         break;
 
+    case ER_TABLE_ENGINE_NOT_ALLOWED:
+        if (inception_enable_set_engine)
+            return false;
+        break;
+
+    case ER_PK_COLS_NOT_INT:
+        if (inception_enable_pk_columns_only_int)
+            return true;
+        else 
+            return false;
+        break;
 
     case ER_TABLE_MUST_HAVE_COMMENT:
         if (inception_check_table_comment)
@@ -2693,8 +2713,7 @@ mysql_convert_desc_to_table_info(
     DBUG_ENTER("mysql_convert_desc_to_table_info");
 
     //free memory
-    table_info = (table_info_t*)malloc(sizeof(table_info_t));
-    memset(table_info, 0, sizeof(table_info_t));
+    table_info = (table_info_t*)my_malloc(sizeof(table_info_t), MY_ZEROFILL);
     LIST_INIT(table_info->field_lst);
 
     strcpy(table_info->table_name, tablename);
@@ -2704,9 +2723,7 @@ mysql_convert_desc_to_table_info(
     while (source_row)
     {
         //free memory
-        field_info = (field_info_t*)malloc(sizeof(field_info_t));
-
-        memset(field_info, 0, sizeof(field_info_t));
+        field_info = (field_info_t*)my_malloc(sizeof(field_info_t), MY_ZEROFILL);
         strcpy(field_info->field_name, source_row[0]);
         if (strcasecmp(source_row[3], "YES") == 0)
             field_info->nullable = true;
@@ -2725,7 +2742,14 @@ mysql_convert_desc_to_table_info(
         if (source_row[2] != NULL)
             field_info->charset = get_charset(get_collation_number(source_row[2]),MYF(0));
 
-        strcpy(field_info->data_type, source_row[1]);
+        if (!strncasecmp("set(", source_row[1], 4))
+            strcpy(field_info->data_type, "set");
+        else if (!strncasecmp("enum(", source_row[1], 5))
+            strcpy(field_info->data_type, "enum");
+        else if (strlen(source_row[1]) > FN_LEN)
+            strcpy(field_info->data_type, "UNKNOWN");
+        else
+            strcpy(field_info->data_type, source_row[1]);
 
         LIST_ADD_LAST(link, table_info->field_lst, field_info);
         source_row = mysql_fetch_row(source_res);
@@ -3213,6 +3237,19 @@ int mysql_check_version_56(THD* thd)
     return true;
 }
 
+int mysql_check_version_57(THD* thd)
+{
+    MYSQL* mysql;
+    mysql = thd->get_audit_connection();
+    if (!mysql)
+        return false;
+
+    if (mysql && strncmp(mysql->server_version, "5.7", 3) < 0)
+        return false;
+
+    return true;
+}
+
 int mysql_check_insert_select_ex(THD *thd, table_info_t* table_info)
 {
     ORDER*   order;
@@ -3690,9 +3727,9 @@ void mysql_free_explain_info(explain_info_t* explain)
         if (select_info->possible_keys != NULL)
         {
             while (select_info->possible_keys[i])
-            {
                 free(select_info->possible_keys[i++]);
-            }
+            free(select_info->possible_keys);
+            select_info->possible_keys = NULL;
         }
 
         my_free(select_info);
@@ -4274,6 +4311,11 @@ int mysql_check_update(THD *thd)
     {
         for (table=thd->lex->query_tables; table; table=table->next_global)
         {
+            if (table->table_name && *table->table_name == '*')
+            {
+                continue;
+            }
+
             table_info = mysql_get_table_object(thd, table->db, table->table_name, TRUE);
             if (table_info == NULL) {
                 tablenotexisted=true;
@@ -4626,6 +4668,26 @@ err:
     return ret;
 }
 
+dbinfo_t*
+mysql_free_db_object(
+                     THD *  thd
+                     )
+{
+    dbinfo_t* dbinfo;
+    dbinfo_t* dbinfo_next;
+    
+    dbinfo = LIST_GET_FIRST(thd->dbcache.dbcache_lst);
+    while (dbinfo != NULL)
+    {
+        dbinfo_next = LIST_GET_NEXT(link, dbinfo);
+        LIST_REMOVE(link, thd->dbcache.dbcache_lst, dbinfo);
+        my_free(dbinfo);
+        dbinfo = dbinfo_next;
+    }
+    
+    return NULL;
+}
+
 int mysql_check_db_existed(
     THD *  thd,
     char*  db_name
@@ -4761,11 +4823,27 @@ int mysql_check_create_table(THD *thd)
         }
     }
 
-    if (create_info_ptr->db_type != (handlerton *)DB_TYPE_INNODB)
+    if (inception_enable_set_engine)
     {
-        my_error(ER_TABLE_MUST_INNODB, MYF(0), create_table->table_name);
-        mysql_errmsg_append(thd);
+        if(create_info_ptr->db_type != (handlerton *)DB_TYPE_INNODB)
+        {
+            my_error(ER_TABLE_MUST_INNODB, MYF(0), create_table->table_name);
+            mysql_errmsg_append(thd);
+        }
+    }else
+    {
+        if (create_info_ptr->db_type != NULL)
+        {
+            my_error(ER_TABLE_ENGINE_NOT_ALLOWED, MYF(0), create_table->table_name);
+            mysql_errmsg_append(thd);
+        }
     }
+
+//    if (create_info_ptr->db_type != (handlerton *)DB_TYPE_INNODB)
+//    {
+//        my_error(ER_TABLE_MUST_INNODB, MYF(0), create_table->table_name);
+//        mysql_errmsg_append(thd);
+//    }
 
     if (create_info_ptr->default_table_charset == NULL ||
         !mysql_check_charset(create_info_ptr->default_table_charset->csname))
@@ -4938,6 +5016,14 @@ int mysql_check_create_index(THD *thd)
 
         uint keymaxlen=0;
         mysql_check_index_attribute(thd, key, table_info->table_name);
+        if (key->type == Key::PRIMARY && 
+            key->columns.elements > inception_max_primary_key_parts)
+        {
+            my_error(ER_PK_TOO_MANY_PARTS, MYF(0), 
+                table_info->db_name, table_info->table_name, 
+                inception_max_primary_key_parts);
+                mysql_errmsg_append(thd);
+        }
 
         key_count++;
 
@@ -4963,6 +5049,16 @@ int mysql_check_create_index(THD *thd)
                         keymaxlen += field_node->max_length;
                     }
 
+                    if (key->type == Key::PRIMARY &&
+                        field_node->real_type != MYSQL_TYPE_INT24 &&
+                        field_node->real_type != MYSQL_TYPE_LONGLONG &&
+                        field_node->real_type != MYSQL_TYPE_LONG &&
+                        inception_enable_pk_columns_only_int)
+                    {
+                        my_error(ER_PK_COLS_NOT_INT, MYF(0), col1->field_name.str, 
+                            table_info->db_name, table_info->table_name);
+                              mysql_errmsg_append(thd);
+                    }
                     found = TRUE;
                     break;
                 }
@@ -4982,10 +5078,25 @@ int mysql_check_create_index(THD *thd)
             }
         }
 
-        if (keymaxlen > MAX_KEY_LENGTH)
-        {
-            my_error(ER_TOO_LONG_KEY,MYF(0),key->name.str, MAX_KEY_LENGTH); 
-            mysql_errmsg_append(thd);
+//        if (keymaxlen > MAX_KEY_LENGTH)
+//        {
+//            my_error(ER_TOO_LONG_KEY,MYF(0),key->name.str, MAX_KEY_LENGTH);
+//            mysql_errmsg_append(thd);
+//        }
+        // 5.7开始默认索引长度限制为3072bytes
+        if (mysql_check_version_57(thd)){
+            if (keymaxlen > 3072)
+                {
+                    my_error(ER_TOO_LONG_KEY,MYF(0),key->name.str, 3072);
+                    mysql_errmsg_append(thd);
+                }
+        }
+        else{
+            if (keymaxlen > MAX_KEY_LENGTH)
+            {
+                my_error(ER_TOO_LONG_KEY,MYF(0),key->name.str, MAX_KEY_LENGTH);
+                mysql_errmsg_append(thd);
+            }
         }
 
         if (!table_info->new_cache)
@@ -5134,7 +5245,9 @@ int mysql_check_column_default(
                 str_to_time(system_charset_info, res->ptr(), res->length(), &ltime, 0, &status);
             else
                 str_to_datetime(system_charset_info, res->ptr(), res->length(), &ltime, 
-                    MODE_NO_ZERO_DATE|MODE_NO_ZERO_IN_DATE, &status);
+//                    MODE_NO_ZERO_DATE|MODE_NO_ZERO_IN_DATE, &status);
+            	//允许日期为全0
+                    NULL, &status);
             //在上面没有检查出来的情况下，还需要对范围溢出做检查
             if (status.warnings == 0)
             {
@@ -5983,10 +6096,26 @@ int mysql_check_alter_option(THD *thd)
     {
         if (create_info.used_fields & HA_CREATE_USED_ENGINE)
         {
-            if (create_info.db_type != (handlerton *)DB_TYPE_INNODB)
+//            if (create_info.db_type != (handlerton *)DB_TYPE_INNODB)
+//            {
+//                my_error(ER_TABLE_MUST_INNODB, MYF(0), thd->lex->query_tables->table_name);
+//                mysql_errmsg_append(thd);
+//            }
+
+            if (inception_enable_set_engine)
             {
-                my_error(ER_TABLE_MUST_INNODB, MYF(0), thd->lex->query_tables->table_name);
-                mysql_errmsg_append(thd);
+                if(create_info.db_type != (handlerton *)DB_TYPE_INNODB)
+                {
+                    my_error(ER_TABLE_MUST_INNODB, MYF(0), thd->lex->query_tables->table_name);
+                    mysql_errmsg_append(thd);
+                }
+            }else
+            {
+                if (create_info.db_type != NULL)
+                {
+                    my_error(ER_TABLE_ENGINE_NOT_ALLOWED, MYF(0), thd->lex->query_tables->table_name);
+                    mysql_errmsg_append(thd);
+                }
             }
 
             create_info.used_fields &= ~HA_CREATE_USED_ENGINE;
@@ -6412,17 +6541,44 @@ mysql_load_tables(
 
     tables = &select_lex->table_list;
 
-    for (table= tables->first; table; table= table->next_local)
-    {
-        tableinfo = mysql_get_table_object(thd, table->db, table->table_name, TRUE);
-        //如果有自连接，或者在不同层次使用了同一个表，那么以上层主准
-        if (tableinfo)
+    if (thd->lex->sql_command == SQLCOM_UPDATE_MULTI || thd->lex->sql_command == SQLCOM_DELETE_MULTI){
+        TABLE_LIST *table;
+        for (table=thd->lex->query_tables; table; table=table->next_global)
         {
-            tablert = (table_rt_t*)my_malloc(sizeof(table_rt_t), MY_ZEROFILL);
-            tablert->table_info = tableinfo;
-            if (table->alias)
-                strcpy(tablert->alias, table->alias);
-            LIST_ADD_LAST(link, rt->table_rt_lst, tablert);
+            if (table->table_name && *table->table_name == '*')
+            {
+                continue;
+            }
+
+            tableinfo = mysql_get_table_object(thd, table->db, table->table_name, TRUE);
+            //如果有自连接，或者在不同层次使用了同一个表，那么以上层主准
+            if (tableinfo)
+            {
+                tablert = (table_rt_t*)my_malloc(sizeof(table_rt_t), MY_ZEROFILL);
+                tablert->table_info = tableinfo;
+                if (table->alias)
+                    strcpy(tablert->alias, table->alias);
+                LIST_ADD_LAST(link, rt->table_rt_lst, tablert);
+            }
+        }
+    }
+    else{
+        tables = &select_lex->table_list;
+        for (table= tables->first; table; table= table->next_local)
+        {
+            if (strcmp(table->db ,"") == 0 && strcmp(table->table_name ,"*") == 0 )
+                    continue;
+
+            tableinfo = mysql_get_table_object(thd, table->db, table->table_name, TRUE);
+            //如果有自连接，或者在不同层次使用了同一个表，那么以上层主准
+            if (tableinfo)
+            {
+                tablert = (table_rt_t*)my_malloc(sizeof(table_rt_t), MY_ZEROFILL);
+                tablert->table_info = tableinfo;
+                if (table->alias)
+                    strcpy(tablert->alias, table->alias);
+                LIST_ADD_LAST(link, rt->table_rt_lst, tablert);
+            }
         }
     }
 
@@ -6487,6 +6643,11 @@ retry:
                         if (!strcasecmp(tableinfo->table_name, tablename) ||
                             !strcasecmp(ret_tablert->alias, tablename))
                         {
+                            return ret_tablert;
+                        }
+                        else if (thd->lex->sql_command == SQLCOM_UPDATE_MULTI ||
+                            thd->lex->sql_command == SQLCOM_DELETE_MULTI ){
+                            // 如果是update/delete多表,不再进行列校验,由explain实现.
                             return ret_tablert;
                         }
                     }
@@ -6917,6 +7078,7 @@ print_item(
             str_append(print_str, "\"value\":");
             str_append(print_str, fieldname);
             str_append(print_str, "}");
+            my_free(fieldname);
         }
         break;
     case Item::FIELD_ITEM:
@@ -7063,6 +7225,7 @@ print_item(
             str_append(print_str, "\"value\":");
             str_append(print_str, fieldname);
             str_append(print_str, "}");
+            my_free(fieldname);
         }
         break;
     default:
@@ -7827,15 +7990,16 @@ int mysql_get_create_sql_backup_table(
     create_sql->append("start_binlog_pos int,");
     create_sql->append("end_binlog_file varchar(512),");
     create_sql->append("end_binlog_pos int,");
-    create_sql->append("sql_statement text,");
+    create_sql->append("sql_statement longtext,");
     create_sql->append("host VARCHAR(64),");
     create_sql->append("dbname VARCHAR(64),");
     create_sql->append("tablename VARCHAR(64),");
     create_sql->append("port INT,");
     create_sql->append("time TIMESTAMP,");
-    create_sql->append("type VARCHAR(20)");
+    create_sql->append("type VARCHAR(20),");
+    create_sql->append("PRIMARY KEY(opid_time)");
 
-    create_sql->append(")ENGINE INNODB DEFAULT CHARSET UTF8;");
+    create_sql->append(")ENGINE INNODB DEFAULT CHARSET UTF8MB4 ROW_FORMAT compressed;");
 
     return 0;
 }
@@ -7855,10 +8019,10 @@ int mysql_get_create_sql_from_table_info(
     create_sql->append("(");
 
     create_sql->append("id bigint auto_increment primary key, ");
-    create_sql->append("rollback_statement mediumtext, ");
-    create_sql->append("opid_time varchar(50)");
-
-    create_sql->append(") ENGINE INNODB DEFAULT CHARSET UTF8;");
+    create_sql->append("rollback_statement longtext, ");
+    create_sql->append("opid_time varchar(50), ");
+    create_sql->append("KEY idx_opid_time (opid_time)");
+    create_sql->append(") ENGINE INNODB DEFAULT CHARSET UTF8MB4 ROW_FORMAT compressed;");
 
     return 0;
 }
@@ -7888,7 +8052,9 @@ mysql_sql_cache_is_valid(
         sql_cache_node->optype == SQLCOM_INSERT ||
         sql_cache_node->optype == SQLCOM_DELETE ||
         sql_cache_node->optype == SQLCOM_INSERT_SELECT ||
-        sql_cache_node->optype == SQLCOM_UPDATE)
+        sql_cache_node->optype == SQLCOM_UPDATE ||
+        sql_cache_node->optype == SQLCOM_UPDATE_MULTI ||
+        sql_cache_node->optype == SQLCOM_DELETE_MULTI)
         && sql_cache_node->exe_complete)
     {
         return TRUE;
@@ -7929,7 +8095,7 @@ int mysql_get_statistic_table_sql(
     create_sql->append("createdb int not null default 0, ");
     create_sql->append("truncating int not null default 0 ");
 
-    create_sql->append(") ENGINE INNODB DEFAULT CHARSET UTF8;");
+    create_sql->append(") ENGINE INNODB DEFAULT CHARSET UTF8 ROW_FORMAT compressed;");
 
     return 0;
 }
@@ -8090,7 +8256,7 @@ int mysql_make_sure_backupdb_table_exist(THD *thd, sql_cache_node_t* sql_cache_n
 
     DBUG_ENTER("mysql_make_sure_backupdb_table_exist");
 
-    if (sql_cache_node->table_info->remote_existed)
+    if (sql_cache_node->table_info == NULL || sql_cache_node->table_info->remote_existed)
         DBUG_RETURN(FALSE);
 
     if (mysql_get_remote_backup_dbname(thd->thd_sinfo->host, thd->thd_sinfo->port,
@@ -9048,6 +9214,7 @@ int mysql_get_field_string(Field* field, String* backupsql, char* null_arr, int 
     String buffer((char*) buff,sizeof(buff),&my_charset_bin);
     String buffer2((char*) buff,sizeof(buff),&my_charset_bin);
     char* dupcharfield;
+    std::stringstream ss;
 
     // backupsql->append(separated);
 
@@ -9126,13 +9293,27 @@ int mysql_get_field_string(Field* field, String* backupsql, char* null_arr, int 
             {
                 //    float nr;
                 //    nr= (float) field->val_real();
-                res=field->val_str(&buffer);
+                //    res=field->val_str(&buffer);
+                float nr= field->val_real();
+                ss.clear(); // 清空
+                ss<<nr;
+
+                backupsql->append(ss.str().c_str());
+                append_flag = FALSE;
+                ss.str("");
                 break;
             }
         case MYSQL_TYPE_DOUBLE:
             {
-                res=field->val_str(&buffer);
+                //    res=field->val_str(&buffer);
                 //    double nr= field->val_real();
+                double nr= field->val_real();
+                ss.clear(); // 清空
+                ss<<nr;
+
+                backupsql->append(ss.str().c_str());
+                append_flag = FALSE;
+                ss.str("");
                 break;
             }
         case MYSQL_TYPE_DATETIME:
@@ -9233,9 +9414,11 @@ int mysql_execute_backup_info_insert_sql(
         backup_sql->append("\'INSERT\'");
         break;
     case SQLCOM_DELETE:
+    case SQLCOM_DELETE_MULTI:
         backup_sql->append("\'DELETE\'");
         break;
     case SQLCOM_UPDATE:
+    case SQLCOM_UPDATE_MULTI:
         backup_sql->append("\'UPDATE\'");
         break;
     case SQLCOM_CREATE_DB:
@@ -9877,8 +10060,19 @@ int mysql_alloc_record(table_info_t* table_info, MYSQL *mysql)
         field_info->flags = field->flags;
         field_info->decimals = field->decimals;
 
+        field_info->field_length =field->length;
+        if (field->length > MAX_DATETIME_WIDTH &&
+            field_info->real_type == MYSQL_TYPE_DATETIME)
+            field_info->real_type = MYSQL_TYPE_DATETIME2;
+        if (field->length > MAX_DATETIME_WIDTH &&
+            field_info->real_type == MYSQL_TYPE_TIMESTAMP)
+            field_info->real_type = MYSQL_TYPE_TIMESTAMP2;
+        if (field->length > MAX_TIME_WIDTH &&
+            field_info->real_type == MYSQL_TYPE_TIME)
+            field_info->real_type = MYSQL_TYPE_TIME2;
+
         field_info->charsetnr = field->charsetnr;
-        field_info->max_length = calc_pack_length(field->type,field->length);
+        field_info->max_length = calc_pack_length(field_info->real_type,field->length);
 
         //调整最大长度，根据表定义的字符集来调整
         if (field_info->charset)
@@ -9890,7 +10084,7 @@ int mysql_alloc_record(table_info_t* table_info, MYSQL *mysql)
             field_info->charsetnr = field_info->charset->number;
         }
 
-        max_length += calc_pack_length(field->type,field_info->max_length);
+        max_length += calc_pack_length(field_info->real_type,field_info->max_length);
         mysql_prepare_field(field_info);
 
         field_info = LIST_GET_NEXT(link, field_info);
@@ -9905,7 +10099,7 @@ int mysql_alloc_record(table_info_t* table_info, MYSQL *mysql)
     {
         field = &source_res->fields[i];
         field_info->field_ptr = table_info->record + max_length;
-        max_length += calc_pack_length(field->type,field_info->max_length);
+        max_length += calc_pack_length(field_info->real_type,field_info->max_length);
         field_info = LIST_GET_NEXT(link, field_info);
     }
 
@@ -10109,6 +10303,38 @@ int mysql_modify_binlog_format_row(MYSQL *mysql)
     DBUG_ENTER("mysql_modify_binlog_format_row");
 
     sprintf(set_format, "set binlog_format=row;");
+    if (mysql_real_query(mysql, set_format, strlen(set_format)))
+    {
+        my_message(mysql_errno(mysql), mysql_error(mysql), MYF(0));
+        DBUG_RETURN(true);
+    }
+
+    DBUG_RETURN(false);
+}
+
+int mysql_close_sql_safe_updates(MYSQL* mysql)
+{
+    char set_format[32];
+
+    DBUG_ENTER("mysql_close_sql_safe_updates");
+
+    sprintf(set_format, "set session sql_safe_updates=0;");
+    if (mysql_real_query(mysql, set_format, strlen(set_format)))
+    {
+        my_message(mysql_errno(mysql), mysql_error(mysql), MYF(0));
+        DBUG_RETURN(ER_NO);
+    }
+
+    DBUG_RETURN(false);
+}
+
+int mysql_set_wait_timeout(MYSQL *mysql)
+{
+    char set_format[32];
+
+    DBUG_ENTER("mysql_modify_sql_safe_update");
+
+    sprintf(set_format,"set session wait_timeout=28800;");
     if (mysql_real_query(mysql, set_format, strlen(set_format)))
     {
         my_message(mysql_errno(mysql), mysql_error(mysql), MYF(0));
@@ -10381,8 +10607,8 @@ int mysql_execute_alter_table_osc(
     sql_cache_node_t* sql_cache_node
 )
 {
-    str_t       osc_cmd;
-    str_t*      osc_cmd_ptr;
+//    str_t       osc_cmd;
+//    str_t*      osc_cmd_ptr;
     char        cmd_line[100];
     int         ret;
     char*       oscargv[100];
@@ -10393,7 +10619,7 @@ int mysql_execute_alter_table_osc(
 
     DBUG_ENTER("mysql_execute_alter_table_osc");
     osc_prepend_PATH(inception_osc_bin_dir, thd, sql_cache_node);
-    osc_cmd_ptr = str_init(&osc_cmd);
+//    osc_cmd_ptr = str_init(&osc_cmd);
     oscargv[count++] = strdup("pt-online-schema-change");
     oscargv[count++] = strdup("--alter");
     oscargv[count++] = strdup(mysql_get_alter_table_post_part(
@@ -10832,6 +11058,9 @@ mysql_backup_sql(
     sql_cache_node_t* sql_cache_node
 )
 {
+    if (sql_cache_node->table_info == NULL)
+        return FALSE;
+
     if (mysql_sql_cache_is_valid_for_ddl(sql_cache_node) &&
         mysql_backup_single_ddl_statement(thd, mi, mysql, sql_cache_node))
     {
@@ -11108,6 +11337,8 @@ int mysql_get_remote_variables(THD* thd)
     }
 
     mysql_free_result(source_res);
+    if (mysql_close_sql_safe_updates(mysql) == ER_NO)
+        DBUG_RETURN(ER_NO);
     DBUG_RETURN(false);
 }
 
@@ -11145,6 +11376,12 @@ int mysql_check_binlog_format(THD* thd, char* binlogformat)
     }
 
     mysql_free_result(source_res);
+    sprintf(set_format,"set session wait_timeout=28800;");
+    if (mysql_real_query(mysql, set_format, strlen(set_format)))
+    {
+        my_message(mysql_errno(mysql), mysql_error(mysql), MYF(0));
+        DBUG_RETURN(ER_NO);
+    }
     DBUG_RETURN(false);
 }
 
@@ -11340,6 +11577,7 @@ int mysql_deinit_sql_cache(THD* thd)
 
     thd->current_execute = NULL;
     str_deinit(thd->errmsg);
+    my_free(thd->errmsg);
     thd->errmsg = NULL;
     if (thd->sql_cache == NULL)
     {
@@ -11358,6 +11596,7 @@ int mysql_deinit_sql_cache(THD* thd)
 
         str_deinit(sql_cache_node->errmsg);
         str_deinit(sql_cache_node->stagereport);
+        my_free(sql_cache_node->stagereport);
         str_deinit(sql_cache_node->ddl_rollback);
 
         if (sql_cache_node->sqlsha1[0] != '\0')
@@ -11386,6 +11625,7 @@ int mysql_deinit_sql_cache(THD* thd)
             query_rt = query_rt_next;
         }
 
+        my_free(sql_cache_node->rt_lst);
         my_free(sql_cache_node);
         sql_cache_node = sql_cache_node_next;
     }
@@ -11428,6 +11668,7 @@ int mysql_deinit_sql_cache(THD* thd)
 
     my_free(thd->query_print_cache);
     thd->query_print_cache= NULL;
+    mysql_free_db_object(thd);
 
     DBUG_RETURN(FALSE);
 }

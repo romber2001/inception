@@ -669,6 +669,12 @@ static Sys_var_ulong Sys_inception_max_key_parts(
     GLOBAL_VAR(inception_max_key_parts), CMD_LINE(REQUIRED_ARG),
     VALID_RANGE(1, 64), DEFAULT(5), BLOCK_SIZE(1));
 
+static Sys_var_ulong Sys_inception_max_primary_key_parts(
+    "inception_max_primary_key_parts",
+    "set the max primary key parts when create table.",
+    GLOBAL_VAR(inception_max_primary_key_parts), CMD_LINE(REQUIRED_ARG),
+    VALID_RANGE(1, 64), DEFAULT(5), BLOCK_SIZE(1));
+
 static Sys_var_ulong Sys_inception_max_update_rows(
     "inception_max_update_rows",
     "set the max estimated rows when execute dml",
@@ -686,6 +692,12 @@ static Sys_var_mybool Sys_inception_enable_not_innodb(
     "check innodb engine when create table ",
     GLOBAL_VAR(inception_enable_not_innodb),
     CMD_LINE(OPT_ARG), DEFAULT(FALSE));
+
+static Sys_var_mybool Sys_inception_enable_set_engine(
+        "inception_enable_set_engine",
+        "check engine when create table ",
+        GLOBAL_VAR(inception_enable_set_engine),
+        CMD_LINE(OPT_ARG), DEFAULT(TRUE));
 
 static bool check_charset(sys_var *self, THD *thd, set_var *var)
 {
@@ -717,6 +729,12 @@ err:
     my_free(charset);
     return false;
 }
+
+static Sys_var_charptr Sys_inception_language_code(
+    "inception_language_code",
+    "A string representing the language. See the list of language identifiers and Internationalization and localization.",
+    READ_ONLY GLOBAL_VAR(inception_language_code), CMD_LINE(REQUIRED_ARG),
+    IN_FS_CHARSET, DEFAULT("en-US"));
 
 static Sys_var_charptr Sys_inception_support_charset(
     "inception_support_charset",
@@ -767,6 +785,12 @@ static Sys_var_mybool Sys_inception_check_index_prefix(
     "check the prefix of index name",
     GLOBAL_VAR(inception_check_index_prefix),
     CMD_LINE(OPT_ARG), DEFAULT(TRUE));
+
+static Sys_var_mybool Sys_inception_enable_pk_columns_only_int(
+    "inception_enable_pk_columns_only_int",
+    "create table primary key must use int or bigint ",
+    GLOBAL_VAR(inception_enable_pk_columns_only_int),
+    CMD_LINE(OPT_ARG), DEFAULT(FALSE));
 
 static Sys_var_mybool Sys_inception_enable_autoincrement_unsigned(
     "inception_enable_autoincrement_unsigned",
