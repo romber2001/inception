@@ -4762,6 +4762,12 @@ int mysql_check_create_table(THD *thd)
     HA_CREATE_INFO* create_info_ptr = &create_info;
     thd->timestamp_count = 0;
 
+    // romber: set table charset by database charset to allow create table statement that does not have charset clause to increase the compatibility
+    if (create_info_ptr->default_table_charset == NULL && thd->lex->query_tables && thd->lex->query_tables->db) {
+        char *db_name = (char *)thd->lex->query_tables->db;
+        set_create_table_default_charset(thd, create_info_ptr, db_name);
+    }
+
     if (inception_get_type(thd) == INCEPTION_TYPE_SPLIT) {
         mysql_add_split_sql_node(thd, create_table->db, create_table->table_name, MYSQLDDL, 
             thd->lex->sql_command);

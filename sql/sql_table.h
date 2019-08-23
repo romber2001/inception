@@ -237,6 +237,9 @@ bool validate_comment_length(THD *thd, const char *comment_str,
                              size_t *comment_len, uint max_len,
                              uint err_code, const char *comment_name);
 
+// romber: define set_create_table_default_charset, so that it could be included by other file(i.e. sql_parse.cc)
+void set_create_table_default_charset(THD *thd, HA_CREATE_INFO *create_info, char *db);
+
 template<typename T> class List;
 void promote_first_timestamp_column(List<Create_field> *column_definitions);
 

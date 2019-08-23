@@ -30,7 +30,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
 #include "sql_view.h" // view_checksum 
 #include "sql_truncate.h"                       // regenerate_locked_table 
 #include "sql_partition.h"                      // mem_alloc_error,
-// generate_partition_syntax,
+// generate_partition_syntax
 // partition_info
 // NOT_A_PARTITION_ID
 #include "sql_db.h"                             // load_db_opt_by_name
@@ -2390,6 +2390,24 @@ static void set_table_default_charset(THD *thd,
 	}
 }
 
+// romber: set default charset to the create table statement
+void set_create_table_default_charset(THD *thd,
+                                      HA_CREATE_INFO *create_info, char *db)
+{
+    /*
+    If the table character set was not given explicitly,
+    let's fetch the database default character set and
+    apply it to the table.
+    */
+    if (!create_info->default_table_charset)
+    {
+        HA_CREATE_INFO db_info;
+
+        load_db_opt_by_name(thd, db, &db_info);
+
+        create_info->default_table_charset= db_info.default_table_charset;
+    }
+}
 
 /*
 Extend long VARCHAR fields to blob & prepare field if it's a blob
